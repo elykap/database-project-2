@@ -1,0 +1,102 @@
+CREATE TABLE Client (
+    client_id INT AUTO_INCREMENT PRIMARY KEY,
+    first_name VARCHAR(50) NOT NULL,
+    last_name VARCHAR(50) NOT NULL,
+    address VARCHAR(255) NOT NULL,
+    phone VARCHAR(20),
+    email VARCHAR(255) NOT NULL UNIQUE,
+    credit_card_info VARCHAR(200),
+    registration_date DATE NOT NULL
+);
+
+CREATE TABLE ServiceRequest (
+    request_id INT AUTO_INCREMENT PRIMARY KEY,
+    client_id INT NOT NULL,
+    service_address VARCHAR(255) NOT NULL,
+    cleaning_type VARCHAR(30) NOT NULL,
+    number_of_rooms INT NOT NULL,
+    preferred_datetime DATETIME NOT NULL,
+    proposed_budget DECIMAL(10,2) NOT NULL,
+    notes TEXT,
+    status VARCHAR(20) NOT NULL,
+    CONSTRAINT fk_request_client
+        FOREIGN KEY (client_id) REFERENCES Client(client_id)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+CREATE TABLE RequestPhoto (
+    photo_id INT AUTO_INCREMENT PRIMARY KEY,
+    request_id INT NOT NULL,
+    file_url VARCHAR(255) NOT NULL,
+    uploaded_at DATETIME NOT NULL,
+    CONSTRAINT fk_photo_request
+        FOREIGN KEY (request_id) REFERENCES ServiceRequest(request_id)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE TABLE Quote (
+    quote_id INT AUTO_INCREMENT PRIMARY KEY,
+    request_id INT NOT NULL,
+    quoted_price DECIMAL(10,2) NOT NULL,
+    scheduled_time_window VARCHAR(100) NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL,
+    CONSTRAINT fk_quote_request
+        FOREIGN KEY (request_id) REFERENCES ServiceRequest(request_id)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+CREATE TABLE QuoteMessage (
+    quote_message_id INT AUTO_INCREMENT PRIMARY KEY,
+    quote_id INT NOT NULL,
+    sender VARCHAR(10) NOT NULL,
+    message_text TEXT NOT NULL,
+    created_at DATETIME NOT NULL,
+    CONSTRAINT fk_qmsg_quote
+        FOREIGN KEY (quote_id) REFERENCES Quote(quote_id)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE TABLE `Order` (
+    order_id INT AUTO_INCREMENT PRIMARY KEY,
+    quote_id INT NOT NULL,
+    service_datetime DATETIME NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL,
+    CONSTRAINT fk_order_quote
+        FOREIGN KEY (quote_id) REFERENCES Quote(quote_id)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+CREATE TABLE Bill (
+    bill_id INT AUTO_INCREMENT PRIMARY KEY,
+    order_id INT NOT NULL,
+    amount DECIMAL(10,2) NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    created_at DATETIME NOT NULL,
+    CONSTRAINT fk_bill_order
+        FOREIGN KEY (order_id) REFERENCES `Order`(order_id)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+CREATE TABLE BillMessage (
+    bill_message_id INT AUTO_INCREMENT PRIMARY KEY,
+    bill_id INT NOT NULL,
+    sender VARCHAR(10) NOT NULL,
+    message_text TEXT NOT NULL,
+    created_at DATETIME NOT NULL,
+    CONSTRAINT fk_bmsg_bill
+        FOREIGN KEY (bill_id) REFERENCES Bill(bill_id)
+        ON DELETE CASCADE ON UPDATE CASCADE
+);
+
+CREATE TABLE Payment (
+    payment_id INT AUTO_INCREMENT PRIMARY KEY,
+    bill_id INT NOT NULL,
+    amount_paid DECIMAL(10,2) NOT NULL,
+    payment_time DATETIME NOT NULL,
+    status VARCHAR(20) NOT NULL,
+    CONSTRAINT fk_payment_bill
+        FOREIGN KEY (bill_id) REFERENCES Bill(bill_id)
+        ON DELETE RESTRICT ON UPDATE CASCADE
+);
