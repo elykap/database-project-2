@@ -1237,7 +1237,9 @@ app.get('/api/admin/dashboard/prospective-clients', authMiddleware, adminMiddlew
     `SELECT c.client_id, c.first_name, c.last_name, c.username, c.email
      FROM Client c
      LEFT JOIN ServiceRequest r ON c.client_id = r.client_id
-     WHERE r.request_id IS NULL`,
+     WHERE r.request_id IS NULL
+       AND c.is_admin = 0
+       AND c.username <> 'admin'`,
     (err, results) => {
       if (err) {
         console.error('DB error on prospective clients:', err);
