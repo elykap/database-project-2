@@ -31,15 +31,7 @@ npm run dev
 
 Register & Login
 	•	Register any normal client and log in to create service requests.
-	•	Register Anna as a normal account first.
-
-Make Anna an Admin
-
-In phpMyAdmin → SQL tab:
-
-UPDATE Client
-SET is_admin = 1
-WHERE username = 'anna';
+	•	Register Anna as a normal account first, and promote to admin.
 
 ## 6. Log in as Anna (Admin)
 
