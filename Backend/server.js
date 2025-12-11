@@ -3,6 +3,9 @@ const cors = require('cors');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const db = require('./db');
+const path = require('path');
+const fs = require('fs');
+const multer = require('multer');
 
 const app = express();
 
@@ -10,6 +13,26 @@ app.use(express.json());
 app.use(cors());
 
 const JWT_SECRET = 'super_secret_change_me';
+
+const UPLOAD_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+}
+
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, UPLOAD_DIR),
+  filename: (_req, file, cb) => {
+    const safeName = file.originalname.replace(/\s+/g, '-');
+    cb(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}-${safeName}`);
+  }
+});
+
+const upload = multer({
+  storage,
+  limits: { files: 5, fileSize: 5 * 1024 * 1024 }
+});
+
+app.use('/uploads', express.static(UPLOAD_DIR));
 
 // MIDDLEWARE
 
@@ -162,9 +185,9 @@ app.post('/api/login', (req, res) => {
   );
 });
 
-// CLIENT: CREATE SERVICE REQUEST
+// CLIENT: CREATE SERVICE REQUEST (with optional photos)
 
-app.post('/api/requests', authMiddleware, (req, res) => {
+app.post('/api/requests', authMiddleware, upload.array('photos', 5), (req, res) => {
   const clientId = req.user.client_id;
   const {
     service_address,
@@ -187,6 +210,8 @@ app.post('/api/requests', authMiddleware, (req, res) => {
 
   const preferredDate = new Date(preferred_datetime);
   const status = 'pending';
+  const rooms = Number(number_of_rooms);
+  const budget = Number(proposed_budget);
 
   db.query(
     `INSERT INTO ServiceRequest
@@ -197,9 +222,9 @@ app.post('/api/requests', authMiddleware, (req, res) => {
       clientId,
       service_address,
       cleaning_type,
-      number_of_rooms,
+      rooms,
       preferredDate,
-      proposed_budget,
+      budget,
       notes || null,
       status
     ],
@@ -209,10 +234,30 @@ app.post('/api/requests', authMiddleware, (req, res) => {
         return res.status(500).json({ message: 'Server error' });
       }
 
-      return res.status(201).json({
-        message: 'Service request created',
-        request_id: result.insertId
-      });
+      const files = req.files || [];
+      if (files.length === 0) {
+        return res.status(201).json({
+          message: 'Service request created',
+          request_id: result.insertId
+        });
+      }
+
+      const uploadedAt = new Date();
+      const values = files.map((f) => [result.insertId, `/uploads/${f.filename}`, uploadedAt]);
+
+      db.query(
+        'INSERT INTO RequestPhoto (request_id, file_url, uploaded_at) VALUES ?',
+        [values],
+        (err2) => {
+          if (err2) {
+            console.error('DB error on request photos insert:', err2);
+          }
+          return res.status(201).json({
+            message: 'Service request created with photos',
+            request_id: result.insertId
+          });
+        }
+      );
     }
   );
 });
@@ -231,7 +276,31 @@ app.get('/api/my/requests', authMiddleware, (req, res) => {
         return res.status(500).json({ message: 'Server error' });
       }
 
-      return res.json(results);
+      const requestIds = results.map((r) => r.request_id);
+      if (requestIds.length === 0) {
+        return res.json(results);
+      }
+
+      db.query(
+        'SELECT * FROM RequestPhoto WHERE request_id IN (?)',
+        [requestIds],
+        (photoErr, photos) => {
+          if (photoErr) {
+            console.error('DB error on request photos:', photoErr);
+            return res.json(results);
+          }
+          const photoMap = {};
+          photos.forEach((p) => {
+            if (!photoMap[p.request_id]) photoMap[p.request_id] = [];
+            photoMap[p.request_id].push(p);
+          });
+          const withPhotos = results.map((r) => ({
+            ...r,
+            photos: photoMap[r.request_id] || []
+          }));
+          return res.json(withPhotos);
+        }
+      );
     }
   );
 });
@@ -255,6 +324,107 @@ app.get('/api/my/quotes', authMiddleware, (req, res) => {
       }
 
       return res.json(results);
+    }
+  );
+});
+
+// QUOTE MESSAGES (both client and admin)
+
+app.get('/api/quotes/:id/messages', authMiddleware, (req, res) => {
+  const quoteId = req.params.id;
+  const { client_id, is_admin } = req.user;
+
+  db.query(
+    `SELECT q.quote_id, r.client_id
+     FROM Quote q
+     JOIN ServiceRequest r ON q.request_id = r.request_id
+     WHERE q.quote_id = ?`,
+    [quoteId],
+    (err, results) => {
+      if (err) {
+        console.error('DB error on quote message access check:', err);
+        return res.status(500).json({ message: 'Server error' });
+      }
+      if (results.length === 0) {
+        return res.status(404).json({ message: 'Quote not found' });
+      }
+      const quote = results[0];
+      if (!is_admin && quote.client_id !== client_id) {
+        return res.status(403).json({ message: 'Not authorized for this quote' });
+      }
+
+      db.query(
+        'SELECT * FROM QuoteMessage WHERE quote_id = ? ORDER BY created_at ASC',
+        [quoteId],
+        (msgErr, msgs) => {
+          if (msgErr) {
+            console.error('DB error on quote messages:', msgErr);
+            return res.status(500).json({ message: 'Server error' });
+          }
+          return res.json(msgs);
+        }
+      );
+    }
+  );
+});
+
+app.post('/api/quotes/:id/messages', authMiddleware, (req, res) => {
+  const quoteId = req.params.id;
+  const { message_text, action } = req.body;
+  const sender = req.user.is_admin ? 'admin' : 'client';
+  const userClientId = req.user.client_id;
+  const now = new Date();
+
+  if (!message_text || !message_text.trim()) {
+    return res.status(400).json({ message: 'Message text is required' });
+  }
+
+  db.query(
+    `SELECT q.*, r.client_id
+     FROM Quote q
+     JOIN ServiceRequest r ON q.request_id = r.request_id
+     WHERE q.quote_id = ?`,
+    [quoteId],
+    (err, results) => {
+      if (err) {
+        console.error('DB error on quote message select:', err);
+        return res.status(500).json({ message: 'Server error' });
+      }
+      if (results.length === 0) {
+        return res.status(404).json({ message: 'Quote not found' });
+      }
+      const quote = results[0];
+      if (!req.user.is_admin && quote.client_id !== userClientId) {
+        return res.status(403).json({ message: 'Not authorized for this quote' });
+      }
+
+      db.query(
+        `INSERT INTO QuoteMessage (quote_id, sender, message_text, created_at)
+         VALUES (?, ?, ?, ?)`,
+        [quoteId, sender, message_text, now],
+        (msgErr) => {
+          if (msgErr) {
+            console.error('DB error on quote message insert:', msgErr);
+            return res.status(500).json({ message: 'Server error' });
+          }
+
+          if (action === 'cancel' || action === 'reject') {
+            const newStatus = action === 'cancel' ? 'canceled' : 'rejected';
+            db.query(
+              'UPDATE Quote SET status = ? WHERE quote_id = ?',
+              [newStatus, quoteId],
+              (statusErr) => {
+                if (statusErr) {
+                  console.error('DB error on quote status change:', statusErr);
+                }
+                return res.status(201).json({ message: 'Message sent and status updated' });
+              }
+            );
+          } else {
+            return res.status(201).json({ message: 'Message sent' });
+          }
+        }
+      );
     }
   );
 });
@@ -289,6 +459,10 @@ app.post('/api/quotes/:id/accept', authMiddleware, (req, res) => {
 
       if (quote.status === 'accepted') {
         return res.status(400).json({ message: 'Quote already accepted' });
+      }
+
+      if (quote.status === 'canceled' || quote.status === 'rejected') {
+        return res.status(400).json({ message: 'Quote is not active' });
       }
 
       const now = new Date();
@@ -502,7 +676,69 @@ app.get('/api/admin/requests/pending', authMiddleware, adminMiddleware, (req, re
         console.error('DB error on admin pending:', err);
         return res.status(500).json({ message: 'Server error' });
       }
-      return res.json(results);
+      const requestIds = results.map((r) => r.request_id);
+      if (requestIds.length === 0) return res.json(results);
+
+      db.query(
+        'SELECT * FROM RequestPhoto WHERE request_id IN (?)',
+        [requestIds],
+        (photoErr, photos) => {
+          if (photoErr) {
+            console.error('DB error on admin request photos:', photoErr);
+            return res.json(results);
+          }
+          const photoMap = {};
+          photos.forEach((p) => {
+            if (!photoMap[p.request_id]) photoMap[p.request_id] = [];
+            photoMap[p.request_id].push(p);
+          });
+          const withPhotos = results.map((r) => ({
+            ...r,
+            photos: photoMap[r.request_id] || []
+          }));
+          return res.json(withPhotos);
+        }
+      );
+    }
+  );
+});
+
+// ADMIN: REJECT REQUEST WITH NOTE
+
+app.post('/api/admin/requests/:id/reject', authMiddleware, adminMiddleware, (req, res) => {
+  const requestId = req.params.id;
+  const { note } = req.body;
+  if (!note || !note.trim()) {
+    return res.status(400).json({ message: 'Rejection note is required' });
+  }
+
+  db.query(
+    'SELECT * FROM ServiceRequest WHERE request_id = ?',
+    [requestId],
+    (err, results) => {
+      if (err) {
+        console.error('DB error on select request for reject:', err);
+        return res.status(500).json({ message: 'Server error' });
+      }
+      if (results.length === 0) {
+        return res.status(404).json({ message: 'Request not found' });
+      }
+      const request = results[0];
+      if (request.status !== 'pending') {
+        return res.status(400).json({ message: 'Only pending requests can be rejected' });
+      }
+
+      db.query(
+        'UPDATE ServiceRequest SET status = ?, rejection_note = ? WHERE request_id = ?',
+        ['rejected', note, requestId],
+        (err2) => {
+          if (err2) {
+            console.error('DB error on reject request:', err2);
+            return res.status(500).json({ message: 'Server error' });
+          }
+          return res.status(200).json({ message: 'Request rejected with note' });
+        }
+      );
     }
   );
 });
@@ -550,6 +786,25 @@ app.post('/api/admin/quotes', authMiddleware, adminMiddleware, (req, res) => {
   );
 });
 
+// ADMIN: LIST QUOTES (for negotiation visibility)
+
+app.get('/api/admin/quotes', authMiddleware, adminMiddleware, (req, res) => {
+  db.query(
+    `SELECT q.*, r.service_address, r.client_id, c.username, c.first_name, c.last_name
+     FROM Quote q
+     JOIN ServiceRequest r ON q.request_id = r.request_id
+     JOIN Client c ON r.client_id = c.client_id
+     ORDER BY q.created_at DESC`,
+    (err, results) => {
+      if (err) {
+        console.error('DB error on admin quotes list:', err);
+        return res.status(500).json({ message: 'Server error' });
+      }
+      return res.json(results);
+    }
+  );
+});
+
 // ADMIN: LIST ORDERS 
 
 app.get('/api/admin/orders', authMiddleware, adminMiddleware, (req, res) => {
@@ -564,6 +819,96 @@ app.get('/api/admin/orders', authMiddleware, adminMiddleware, (req, res) => {
     (err, results) => {
       if (err) {
         console.error('DB error on admin orders:', err);
+        return res.status(500).json({ message: 'Server error' });
+      }
+      return res.json(results);
+    }
+  );
+});
+
+// ADMIN: PROMOTE USER TO ADMIN (requires existing admin)
+
+app.post('/api/admin/promote', authMiddleware, adminMiddleware, (req, res) => {
+  const { username } = req.body;
+  if (!username) {
+    return res.status(400).json({ message: 'Username is required' });
+  }
+
+  db.query(
+    'SELECT * FROM Client WHERE username = ?',
+    [username],
+    (err, results) => {
+      if (err) {
+        console.error('DB error on promote select:', err);
+        return res.status(500).json({ message: 'Server error' });
+      }
+      if (results.length === 0) {
+        return res.status(404).json({ message: 'User not found' });
+      }
+      const user = results[0];
+      if (user.is_admin) {
+        return res.status(200).json({ message: 'User is already an admin' });
+      }
+      db.query(
+        'UPDATE Client SET is_admin = 1 WHERE client_id = ?',
+        [user.client_id],
+        (updateErr) => {
+          if (updateErr) {
+            console.error('DB error on promote update:', updateErr);
+            return res.status(500).json({ message: 'Server error' });
+          }
+          return res.status(200).json({ message: 'User promoted to admin' });
+        }
+      );
+    }
+  );
+});
+
+// if no admin exists, allow current authenticated user to become admin
+
+app.post('/api/admin/seed-first-admin', authMiddleware, (req, res) => {
+  db.query(
+    'SELECT COUNT(*) AS admin_count FROM Client WHERE is_admin = 1',
+    (err, results) => {
+      if (err) {
+        console.error('DB error on admin count:', err);
+        return res.status(500).json({ message: 'Server error' });
+      }
+      const adminCount = results[0].admin_count;
+      if (adminCount > 0) {
+        return res.status(403).json({ message: 'Admins already exist' });
+      }
+
+      db.query(
+        'UPDATE Client SET is_admin = 1 WHERE client_id = ?',
+        [req.user.client_id],
+        (updateErr) => {
+          if (updateErr) {
+            console.error('DB error on seed admin:', updateErr);
+            return res.status(500).json({ message: 'Server error' });
+          }
+          return res.status(200).json({ message: 'You are now the first admin' });
+        }
+      );
+    }
+  );
+});
+
+// ADMIN: LIST BILLS
+
+app.get('/api/admin/bills', authMiddleware, adminMiddleware, (req, res) => {
+  db.query(
+    `SELECT b.*, o.order_id, q.quote_id, r.request_id, r.service_address,
+            c.first_name, c.last_name, c.username
+     FROM Bill b
+     JOIN \`Order\` o ON b.order_id = o.order_id
+     JOIN Quote q ON o.quote_id = q.quote_id
+     JOIN ServiceRequest r ON q.request_id = r.request_id
+     JOIN Client c ON r.client_id = c.client_id
+     ORDER BY b.created_at DESC`,
+    (err, results) => {
+      if (err) {
+        console.error('DB error on admin bills:', err);
         return res.status(500).json({ message: 'Server error' });
       }
       return res.json(results);
@@ -701,6 +1046,112 @@ app.post('/api/admin/bills/:id/revise', authMiddleware, adminMiddleware, (req, r
   );
 });
 
+// BILL MESSAGES (both client and admin)
+
+app.get('/api/bills/:id/messages', authMiddleware, (req, res) => {
+  const billId = req.params.id;
+  const { client_id, is_admin } = req.user;
+
+  db.query(
+    `SELECT b.bill_id, r.client_id
+     FROM Bill b
+     JOIN \`Order\` o ON b.order_id = o.order_id
+     JOIN Quote q ON o.quote_id = q.quote_id
+     JOIN ServiceRequest r ON q.request_id = r.request_id
+     WHERE b.bill_id = ?`,
+    [billId],
+    (err, results) => {
+      if (err) {
+        console.error('DB error on bill message access:', err);
+        return res.status(500).json({ message: 'Server error' });
+      }
+      if (results.length === 0) {
+        return res.status(404).json({ message: 'Bill not found' });
+      }
+      const bill = results[0];
+      if (!is_admin && bill.client_id !== client_id) {
+        return res.status(403).json({ message: 'Not authorized for this bill' });
+      }
+
+      db.query(
+        'SELECT * FROM BillMessage WHERE bill_id = ? ORDER BY created_at ASC',
+        [billId],
+        (msgErr, msgs) => {
+          if (msgErr) {
+            console.error('DB error on bill messages:', msgErr);
+            return res.status(500).json({ message: 'Server error' });
+          }
+          return res.json(msgs);
+        }
+      );
+    }
+  );
+});
+
+app.post('/api/bills/:id/messages', authMiddleware, (req, res) => {
+  const billId = req.params.id;
+  const { message_text } = req.body;
+  const sender = req.user.is_admin ? 'admin' : 'client';
+  const userClientId = req.user.client_id;
+  const now = new Date();
+
+  if (!message_text || !message_text.trim()) {
+    return res.status(400).json({ message: 'Message text is required' });
+  }
+
+  db.query(
+    `SELECT b.*, r.client_id
+     FROM Bill b
+     JOIN \`Order\` o ON b.order_id = o.order_id
+     JOIN Quote q ON o.quote_id = q.quote_id
+     JOIN ServiceRequest r ON q.request_id = r.request_id
+     WHERE b.bill_id = ?`,
+    [billId],
+    (err, results) => {
+      if (err) {
+        console.error('DB error on bill message select:', err);
+        return res.status(500).json({ message: 'Server error' });
+      }
+      if (results.length === 0) {
+        return res.status(404).json({ message: 'Bill not found' });
+      }
+      const bill = results[0];
+      if (!req.user.is_admin && bill.client_id !== userClientId) {
+        return res.status(403).json({ message: 'Not authorized for this bill' });
+      }
+
+      db.query(
+        `INSERT INTO BillMessage (bill_id, sender, message_text, created_at)
+         VALUES (?, ?, ?, ?)`,
+        [billId, sender, message_text, now],
+        (msgErr) => {
+          if (msgErr) {
+            console.error('DB error on bill message insert:', msgErr);
+            return res.status(500).json({ message: 'Server error' });
+          }
+          if (bill.status === 'paid') {
+            return res.status(201).json({ message: 'Message sent' });
+          }
+          if (sender === 'client' && bill.status === 'pending') {
+            db.query(
+              'UPDATE Bill SET status = ? WHERE bill_id = ?',
+              ['in_dispute', billId],
+              (statusErr) => {
+                if (statusErr) {
+                  console.error('DB error on bill status update:', statusErr);
+                }
+                return res.status(201).json({ message: 'Message sent, bill in dispute' });
+              }
+            );
+          } else {
+            return res.status(201).json({ message: 'Message sent' });
+          }
+        }
+      );
+    }
+  );
+});
+
 // DASHBOARD QUERIES (ADMIN) 
 
 // Frequent clients – completed service orders
@@ -749,24 +1200,35 @@ app.get('/api/admin/dashboard/uncommitted-clients', authMiddleware, adminMiddlew
 
 // This month’s accepted quotes – based on order.created_at this month
 app.get('/api/admin/dashboard/accepted-quotes', authMiddleware, adminMiddleware, (req, res) => {
-  db.query(
-    `SELECT q.*, o.created_at AS accepted_time, c.first_name, c.last_name, c.username
-     FROM Quote q
-     JOIN \`Order\` o ON q.quote_id = o.quote_id
-     JOIN ServiceRequest r ON q.request_id = r.request_id
-     JOIN Client c ON r.client_id = c.client_id
-     WHERE q.status = 'accepted'
-       AND YEAR(o.created_at) = YEAR(NOW())
-       AND MONTH(o.created_at) = MONTH(NOW())
-     ORDER BY o.created_at DESC`,
-    (err, results) => {
-      if (err) {
-        console.error('DB error on accepted quotes:', err);
-        return res.status(500).json({ message: 'Server error' });
-      }
-      return res.json(results);
+  const { year, month } = req.query;
+  let sql = `
+    SELECT q.*, o.created_at AS accepted_time, c.first_name, c.last_name, c.username
+    FROM Quote q
+    JOIN \`Order\` o ON q.quote_id = o.quote_id
+    JOIN ServiceRequest r ON q.request_id = r.request_id
+    JOIN Client c ON r.client_id = c.client_id
+    WHERE q.status = 'accepted'`;
+
+  const params = [];
+  const yr = year ? parseInt(year, 10) : null;
+  const mo = month ? parseInt(month, 10) : null;
+
+  if (yr && mo && mo >= 1 && mo <= 12) {
+    sql += ' AND YEAR(o.created_at) = ? AND MONTH(o.created_at) = ?';
+    params.push(yr, mo);
+  } else {
+    sql += ' AND YEAR(o.created_at) = YEAR(NOW()) AND MONTH(o.created_at) = MONTH(NOW())';
+  }
+
+  sql += ' ORDER BY o.created_at DESC';
+
+  db.query(sql, params, (err, results) => {
+    if (err) {
+      console.error('DB error on accepted quotes:', err);
+      return res.status(500).json({ message: 'Server error' });
     }
-  );
+    return res.json(results);
+  });
 });
 
 // Prospective clients – registered, no requests

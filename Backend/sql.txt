@@ -1,3 +1,13 @@
+DROP TABLE IF EXISTS Payment;
+DROP TABLE IF EXISTS BillMessage;
+DROP TABLE IF EXISTS Bill;
+DROP TABLE IF EXISTS `Order`;
+DROP TABLE IF EXISTS QuoteMessage;
+DROP TABLE IF EXISTS Quote;
+DROP TABLE IF EXISTS RequestPhoto;
+DROP TABLE IF EXISTS ServiceRequest;
+DROP TABLE IF EXISTS Client;
+
 CREATE TABLE Client (
     client_id INT AUTO_INCREMENT PRIMARY KEY,
     first_name VARCHAR(50) NOT NULL,
@@ -21,7 +31,8 @@ CREATE TABLE ServiceRequest (
     preferred_datetime DATETIME NOT NULL,
     proposed_budget DECIMAL(10,2) NOT NULL,
     notes TEXT,
-    status VARCHAR(20) NOT NULL,
+    rejection_note TEXT,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
     CONSTRAINT fk_request_client
         FOREIGN KEY (client_id) REFERENCES Client(client_id)
         ON DELETE RESTRICT ON UPDATE CASCADE
@@ -42,8 +53,8 @@ CREATE TABLE Quote (
     request_id INT NOT NULL,
     quoted_price DECIMAL(10,2) NOT NULL,
     scheduled_time_window VARCHAR(100) NOT NULL,
-    status VARCHAR(20) NOT NULL,
-    created_at DATETIME NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_quote_request
         FOREIGN KEY (request_id) REFERENCES ServiceRequest(request_id)
         ON DELETE RESTRICT ON UPDATE CASCADE
@@ -64,8 +75,8 @@ CREATE TABLE `Order` (
     order_id INT AUTO_INCREMENT PRIMARY KEY,
     quote_id INT NOT NULL,
     service_datetime DATETIME NOT NULL,
-    status VARCHAR(20) NOT NULL,
-    created_at DATETIME NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'scheduled',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_order_quote
         FOREIGN KEY (quote_id) REFERENCES Quote(quote_id)
         ON DELETE RESTRICT ON UPDATE CASCADE
@@ -75,8 +86,8 @@ CREATE TABLE Bill (
     bill_id INT AUTO_INCREMENT PRIMARY KEY,
     order_id INT NOT NULL,
     amount DECIMAL(10,2) NOT NULL,
-    status VARCHAR(20) NOT NULL,
-    created_at DATETIME NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_bill_order
         FOREIGN KEY (order_id) REFERENCES `Order`(order_id)
         ON DELETE RESTRICT ON UPDATE CASCADE
@@ -98,8 +109,110 @@ CREATE TABLE Payment (
     bill_id INT NOT NULL,
     amount_paid DECIMAL(10,2) NOT NULL,
     payment_time DATETIME NOT NULL,
-    status VARCHAR(20) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'success',
     CONSTRAINT fk_payment_bill
         FOREIGN KEY (bill_id) REFERENCES Bill(bill_id)
         ON DELETE RESTRICT ON UPDATE CASCADE
+);
+
+-- queries
+
+-- 3. Frequent clients – by completed service orders
+SELECT c.client_id, c.first_name, c.last_name, c.username,
+       COUNT(o.order_id) AS completed_orders
+FROM Client c
+JOIN ServiceRequest r ON c.client_id = r.client_id
+JOIN Quote q ON r.request_id = q.request_id
+JOIN `Order` o ON q.quote_id = o.quote_id
+WHERE o.status = 'completed'
+GROUP BY c.client_id
+ORDER BY completed_orders DESC;
+
+-- 4. Uncommitted clients – 3+ requests, 0 completed orders
+SELECT c.client_id, c.first_name, c.last_name, c.username,
+       COUNT(DISTINCT r.request_id) AS requests_count,
+       COUNT(DISTINCT o.order_id) AS completed_orders
+FROM Client c
+JOIN ServiceRequest r ON c.client_id = r.client_id
+LEFT JOIN Quote q ON r.request_id = q.request_id
+LEFT JOIN `Order` o ON q.quote_id = o.quote_id AND o.status = 'completed'
+GROUP BY c.client_id
+HAVING requests_count >= 3 AND completed_orders = 0;
+
+-- 5. Accepted quotes for a given month)
+SELECT q.*, o.created_at AS accepted_time, c.first_name, c.last_name, c.username
+FROM Quote q
+JOIN `Order` o ON q.quote_id = o.quote_id
+JOIN ServiceRequest r ON q.request_id = r.request_id
+JOIN Client c ON r.client_id = c.client_id
+WHERE q.status = 'accepted'
+  AND YEAR(o.created_at) = 2025
+  AND MONTH(o.created_at) = 12
+ORDER BY o.created_at DESC;
+
+-- 6. Prospective clients – registered, no requests
+SELECT c.client_id, c.first_name, c.last_name, c.username, c.email
+FROM Client c
+LEFT JOIN ServiceRequest r ON c.client_id = r.client_id
+WHERE r.request_id IS NULL;
+
+-- 7. Largest job – max rooms among completed jobs
+SELECT r.*, c.first_name, c.last_name, c.username
+FROM ServiceRequest r
+JOIN Quote q ON r.request_id = q.request_id
+JOIN `Order` o ON q.quote_id = o.quote_id
+JOIN Client c ON r.client_id = c.client_id
+WHERE o.status = 'completed'
+  AND r.number_of_rooms = (
+    SELECT MAX(r2.number_of_rooms)
+    FROM ServiceRequest r2
+    JOIN Quote q2 ON r2.request_id = q2.request_id
+    JOIN `Order` o2 ON q2.quote_id = o2.quote_id
+    WHERE o2.status = 'completed'
+  );
+
+-- 8. Overdue bills – unpaid older than 7 days
+SELECT b.*, c.first_name, c.last_name, c.username
+FROM Bill b
+JOIN `Order` o ON b.order_id = o.order_id
+JOIN Quote q ON o.quote_id = q.quote_id
+JOIN ServiceRequest r ON q.request_id = r.request_id
+JOIN Client c ON r.client_id = c.client_id
+WHERE b.status <> 'paid'
+  AND b.created_at < (NOW() - INTERVAL 7 DAY);
+
+-- 9. Bad clients – have at least one overdue unpaid bill
+SELECT DISTINCT c.client_id, c.first_name, c.last_name, c.username
+FROM Client c
+JOIN ServiceRequest r ON c.client_id = r.client_id
+JOIN Quote q ON r.request_id = q.request_id
+JOIN `Order` o ON q.quote_id = o.quote_id
+JOIN Bill b ON o.order_id = b.order_id
+WHERE b.status <> 'paid'
+  AND b.created_at < (NOW() - INTERVAL 7 DAY);
+
+-- 10. Good clients – always paid within 24 hours
+SELECT DISTINCT c.client_id, c.first_name, c.last_name, c.username
+FROM Client c
+WHERE EXISTS (
+  SELECT 1
+  FROM Bill b
+  JOIN `Order` o ON b.order_id = o.order_id
+  JOIN Quote q ON o.quote_id = q.quote_id
+  JOIN ServiceRequest r ON q.request_id = r.request_id
+  WHERE r.client_id = c.client_id
+)
+AND NOT EXISTS (
+  SELECT 1
+  FROM Bill b
+  JOIN `Order` o ON b.order_id = o.order_id
+  JOIN Quote q ON o.quote_id = q.quote_id
+  JOIN ServiceRequest r ON q.request_id = r.request_id
+  LEFT JOIN Payment p
+    ON p.bill_id = b.bill_id AND p.status = 'success'
+  WHERE r.client_id = c.client_id
+    AND (
+      p.payment_id IS NULL
+      OR TIMESTAMPDIFF(HOUR, b.created_at, p.payment_time) > 24
+    )
 );
