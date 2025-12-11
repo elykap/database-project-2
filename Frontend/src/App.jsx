@@ -74,7 +74,6 @@ function App() {
         fetchAdminOrders();
         fetchAdminQuotes();
         fetchAdminBills();
-        fetchDashboard();
       }
     } else {
       setMyRequests([]);
@@ -97,6 +96,13 @@ function App() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token, clientInfo?.is_admin]);
+
+  useEffect(() => {
+    if (token && clientInfo?.is_admin) {
+      fetchDashboard(acceptedMonth);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, clientInfo?.is_admin, acceptedMonth]);
 
   //  form handlers 
 
@@ -632,7 +638,10 @@ function App() {
       if (res.ok) setAcceptedQuotes(await res.json());
 
       res = await fetch(`${API_BASE}/api/admin/dashboard/prospective-clients`, { headers });
-      if (res.ok) setProspectiveClients(await res.json());
+      if (res.ok) {
+        const prospects = await res.json();
+        setProspectiveClients(prospects.filter((p) => !p.is_admin && p.username !== 'admin'));
+      }
 
       res = await fetch(`${API_BASE}/api/admin/dashboard/largest-job`, { headers });
       if (res.ok) setLargestJobs(await res.json());
@@ -1446,10 +1455,7 @@ function App() {
                       type="month"
                       className="input"
                       value={acceptedMonth}
-                      onChange={(e) => {
-                        setAcceptedMonth(e.target.value);
-                        fetchDashboard(e.target.value);
-                      }}
+                      onChange={(e) => setAcceptedMonth(e.target.value)}
                     />
                   </label>
                   <button

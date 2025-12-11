@@ -154,7 +154,9 @@ ORDER BY o.created_at DESC;
 SELECT c.client_id, c.first_name, c.last_name, c.username, c.email
 FROM Client c
 LEFT JOIN ServiceRequest r ON c.client_id = r.client_id
-WHERE r.request_id IS NULL;
+WHERE r.request_id IS NULL
+  AND c.is_admin = 0
+  AND c.username <> 'admin';
 
 -- 7. Largest job – max rooms among completed jobs
 SELECT r.*, c.first_name, c.last_name, c.username
