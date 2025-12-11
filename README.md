@@ -54,3 +54,7 @@ Clients can:
 	•	Create cleaning service requests.
 	•	View quotes, accept quotes (creates service orders).
 	•	View bills, pay bills, or dispute them.
+
+## Contributions
+
+Worked alone on this project (no partner). Hours together: 0.
